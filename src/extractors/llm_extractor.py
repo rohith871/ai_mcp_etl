@@ -8,7 +8,7 @@ from config.settings import GROQ_API_KEY, GROQ_MODEL
 from config.schema import CompanySchema
 
 OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
-OLLAMA_MODEL = "qwen2.5-coder:7b"  # Primary Local Model
+OLLAMA_MODEL = "qwen2.5-coder:7b"
 
 SYSTEM_PROMPT = """You are an expert AI market analyst for 'AI Orbit'.
 Analyze the page content and extract structured JSON matching this schema.
@@ -17,13 +17,21 @@ STRICT CLASSIFICATION RULE:
 This database is ONLY for AI companies or AI products.
 If the company is NOT an AI company/product, set "classification_tier": "Non-AI".
 
+CRITICAL LOGO RULE:
+- "logo_url" MUST be a true company logo, square brand icon, or high-resolution favicon URL.
+- DO NOT use banner images, promotional marketing graphics, hero section product screenshots, or feature illustration posters. If no clear logo URL is found, leave it null or use the scraped favicon hint.
+
+CRITICAL FIELD RULES:
+- Change "one_liner" to "short_description" (1 punchy sentence summary).
+- For "open_source_status" and "pricing_model", if exact details are NOT explicitly found in the page text, leave them as null (do NOT output "Unknown").
+
 Schema format:
 {
     "company_name": "Official Name",
     "website_url": "URL",
-    "logo_url": "Direct Image URL or favicon URL",
+    "logo_url": "True company logo or icon URL (NO posters/banners)",
     "github_url": "https://github.com/..." or null,
-    "one_liner": "1-sentence summary",
+    "short_description": "1-sentence summary",
     "long_description": "Detailed description",
     "year_founded": 2024 or null,
     "classification_tier": "AI Native | AI Enabled | AI Adjacent | Non-AI",
@@ -34,9 +42,9 @@ Schema format:
     "deployment_options": [],
     "supported_frameworks": [],
     "has_api": false,
-    "open_source_status": "Fully Open Source | Open Weights | Proprietary | Freemium / Hybrid | Unknown",
+    "open_source_status": "Fully Open Source | Open Weights | Proprietary | Freemium / Hybrid | null",
     "target_audience": [],
-    "pricing_model": "Free Tier / Freemium | Usage-Based | Subscription | Custom Enterprise | Completely Free | Unknown",
+    "pricing_model": "Free Tier / Freemium | Usage-Based | Subscription | Custom Enterprise | Completely Free | null",
     "key_products": [],
     "hq_location": "City, Country" or null,
     "data_confidence_score": 0.95,
@@ -88,12 +96,12 @@ class SchemaExtractor:
                     if "choices" in res_json and len(res_json["choices"]) > 0:
                         raw_content = res_json["choices"][0]["message"]["content"]
                 else:
-                    print(f"⚠️ Ollama returned HTTP {resp.status_code} for {url}. Switching to Groq fallback...")
+                    print(f"⚠️ Ollama HTTP {resp.status_code} for {url}. Switching to Groq fallback...")
         except Exception as e:
-            print(f"⚠️ Local Ollama unreachable/timed out for {url}: {e}. Falling back to Groq Cloud...")
+            print(f"⚠️ Local Ollama unreachable for {url}: {e}. Switching to Groq fallback...")
 
         # ==========================================
-        # FALLBACK: Groq API
+        # FALLBACK: Groq API (With Rate-Limit Catching)
         # ==========================================
         if not raw_content and self.groq_client:
             try:
@@ -113,7 +121,9 @@ class SchemaExtractor:
                 raw_content = response.choices[0].message.content
                 print(f"  ↪️ Extracted successfully via Groq Fallback for: {url}")
             except Exception as e:
-                print(f"❌ Groq Fallback failed for {url}: {e}")
+                # Catches rate limits (429) or other API blocks gracefully and continues pipeline
+                print(f"❌ Groq Fallback failed/Rate-limited for {url}: {e}. Skipping URL...")
+                return None
 
         if not raw_content:
             return None
@@ -126,11 +136,11 @@ class SchemaExtractor:
             data = json.loads(cleaned)
             data["website_url"] = url
             
-            # Prevent Pydantic type errors on boolean
             if data.get("has_api") is None:
                 data["has_api"] = False
 
-            if not data.get("logo_url") and logo_hint:
+            # Prioritize clean favicon/logo hints if LLM returned a banner poster URL
+            if logo_hint and (not data.get("logo_url") or "banner" in data.get("logo_url", "").lower() or "hero" in data.get("logo_url", "").lower()):
                 data["logo_url"] = logo_hint
 
             if github_hint:
@@ -145,15 +155,3 @@ class SchemaExtractor:
             print(f"⚠️ Schema validation error for {url}: {e}")
             return None
 
-    def extract(self, text: str, url: str, logo_hint: str = None, github_hint: str = None) -> Optional[Dict[str, Any]]:
-        """Safe synchronous wrapper for scripts without an existing event loop."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            # If called inside an active loop, raise or route correctly
-            raise RuntimeError("Use 'await extractor.extract_async(...)' when running inside an async event loop.")
-        
-        return asyncio.run(self.extract_async(text, url, logo_hint, github_hint))
